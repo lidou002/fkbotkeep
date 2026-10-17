@@ -1,0 +1,90 @@
+name: botkeep
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "触发来源(manual / worker;worker 表示按每小时一次的频率发 TG 启动通知)"
+        default: manual
+  schedule:
+    - cron: "*/5 * * * *"   # 纯 GitHub 触发;实际间隔可能被延迟到 5~30 分钟
+
+concurrency:
+  group: botkeep
+  cancel-in-progress: false  # 不打断正在运行的实例,避免重复抢
+
+permissions:
+  contents: read
+  actions: write   # 用于保活:防止公开仓库 60 天无活动后定时被停用
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NODE_LINK: ${{ secrets.NODE_LINK }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 冷却 / 登录会话 / 通知计数:每次运行以唯一 key 保存,下次取最近一份
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: .cooldown
+          key: botkeep-state-${{ github.run_id }}
+          restore-keys: botkeep-state-
+
+      - name: Cache sing-box
+        if: env.NODE_LINK != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sing-box-1.14.1
+          key: sing-box-1.14.1
+
+      - name: Start proxy
+        if: env.NODE_LINK != ''
+        env:
+          SING_BOX_SHA256: ${{ secrets.SING_BOX_SHA256 }}
+          NODE_INSECURE: ${{ vars.NODE_INSECURE }}
+        run: |
+          npm install --no-audit --no-fund
+          python3 scripts/start_proxy.py
+
+      - name: Grab
+        env:
+          COOKIE: ${{ secrets.COOKIE }}
+          BOTKEEP_EMAIL: ${{ secrets.BOTKEEP_EMAIL }}
+          BOTKEEP_PASSWORD: ${{ secrets.BOTKEEP_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+          TRIGGER: ${{ github.event_name }}
+          TRIGGER_SOURCE: ${{ github.event_name == 'schedule' && 'worker' || inputs.source }}
+          GUARD_BOT_ID: ${{ vars.GUARD_BOT_ID }}
+          # 不设默认白名单：留空 = 接受任意节点（只受 EXCLUDE_NODES 黑名单约束）
+          INCLUDE_NODES: ${{ vars.INCLUDE_NODES }}
+          EXCLUDE_NODES: ${{ vars.EXCLUDE_NODES || 'node2-it' }}
+          SERVER_NAME: ${{ vars.SERVER_NAME || 'my-project' }}
+          RAM_MB: ${{ vars.RAM_MB || '512' }}
+          CPU_PERCENT: ${{ vars.CPU_PERCENT || '50' }}
+          STORAGE_MB: ${{ vars.STORAGE_MB || '1024' }}
+          RUN_SECONDS: ${{ vars.RUN_SECONDS || '240' }}
+          INTERVAL_SECONDS: ${{ vars.INTERVAL_SECONDS || '20' }}
+        run: node grab.mjs
+
+      - name: Keepalive (re-enable schedule)
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/grab.yml/enable" || true
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cooldown
+          key: botkeep-state-${{ github.run_id }}
